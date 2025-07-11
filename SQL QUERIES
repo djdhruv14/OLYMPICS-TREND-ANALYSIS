@@ -1,0 +1,349 @@
+CREATE DATABASE olympic_wh;
+
+CREATE SCHEMA olympics_db.olympic_wh;
+
+CREATE WAREHOUSE olympic_wh
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 300  -- 5 minutes
+  AUTO_RESUME = TRUE;
+
+USE DATABASE olympics_db;
+USE SCHEMA olympic_data;
+USE WAREHOUSE olympic_wh;
+
+--Create stage for public CSV--
+CREATE STAGE olympic_stage
+  DIRECTORY = (ENABLE = TRUE);
+
+  -- 3. Create file format
+CREATE FILE FORMAT olympic_csv_format
+  TYPE = CSV
+  SKIP_HEADER = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+-- Create table FIRST
+CREATE OR REPLACE TABLE raw_olympics (
+  athlete_id INT,
+  name STRING,
+  sex STRING,
+  age INT,
+  height FLOAT,
+  weight FLOAT,
+  team STRING,
+  noc STRING,
+  games STRING,
+  year INT,
+  season STRING,
+  city STRING,
+  sport STRING,
+  event STRING,
+  medal STRING
+);
+
+--Create file format
+CREATE OR REPLACE FILE FORMAT olympic_csv_format
+  TYPE = CSV
+  SKIP_HEADER = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+
+--Load data (AFTER table creation and file upload)
+COPY INTO raw_olympics
+FROM @olympic_stage
+FILE_FORMAT = olympic_csv_format;
+
+
+
+  --
+
+-- Reload data
+TRUNCATE TABLE raw_olympics;  -- Clear previous load attempt
+COPY INTO raw_olympics
+FROM @olympic_stage
+FILE_FORMAT = olympic_csv_format;
+
+
+SELECT * FROM medal_analysis
+WHERE rank_in_sport = 1
+  AND year BETWEEN 2010 AND 2020
+ORDER BY year DESC, sport;
+
+CREATE OR REPLACE VIEW clean_olympics AS
+SELECT
+  athlete_id::INT AS athlete_id,
+  name,
+  sex,
+  NULLIF(age, 'NULL')::INT AS age,
+  NULLIF(height, 'NULL')::FLOAT AS height,
+  NULLIF(weight, 'NULL')::FLOAT AS weight,
+  team,
+  noc,
+  games,
+  year::INT AS year,
+  season,
+  city,
+  sport,
+  event,
+  medal
+FROM raw_olympics
+WHERE age <> 'NA' 
+  AND height <> 'NA' 
+  AND weight <> 'NA';
+
+
+
+
+
+
+
+--PERFORMANCE ANALYSIS VIEW ***************
+CREATE OR REPLACE SECURE VIEW medal_analysis AS
+WITH medal_counts AS (
+  SELECT
+    noc,
+    sport,
+    year,
+    COUNT_IF(medal = 'Gold') AS gold,
+    COUNT_IF(medal = 'Silver') AS silver,
+    COUNT_IF(medal = 'Bronze') AS bronze
+  FROM clean_olympics
+  GROUP BY noc, sport, year
+)
+SELECT 
+  noc,
+  sport,
+  year,
+  gold,
+  silver,
+  bronze,
+  gold + silver + bronze AS total_medals,
+  RANK() OVER (PARTITION BY sport, year ORDER BY total_medals DESC) AS rank_in_sport,
+  LAG(total_medals) OVER (PARTITION BY noc, sport ORDER BY year) AS prev_year_medals
+FROM medal_counts;
+
+
+
+SELECT * FROM medal_analysis
+WHERE rank_in_sport = 1
+  AND year BETWEEN 2010 AND 2020
+ORDER BY year DESC, sport;
+
+
+
+    CREATE OR REPLACE TABLE clean_olympics AS
+SELECT *
+FROM raw_olympics
+WHERE 
+    athlete_id IS NOT NULL
+    AND name IS NOT NULL
+    AND sex IS NOT NULL
+    AND age IS NOT NULL
+    AND height IS NOT NULL
+    AND weight IS NOT NULL
+    AND team IS NOT NULL
+    AND noc IS NOT NULL
+    AND games IS NOT NULL
+    AND year IS NOT NULL
+    AND season IS NOT NULL
+    AND city IS NOT NULL
+    AND sport IS NOT NULL
+    AND event IS NOT NULL
+    AND medal IS NOT NULL;
+
+
+ --BMI ANALYSIS FUNCTION ***************
+CREATE OR REPLACE FUNCTION calculate_bmi(height_cm FLOAT, weight_kg FLOAT)
+RETURNS FLOAT
+AS
+$$
+  CASE
+    WHEN height_cm <= 0 OR weight_kg <= 0 THEN NULL
+    ELSE ROUND(weight_kg / POWER(height_cm/100, 2), 1)
+  END
+$$;
+
+-- BMI analysis by sport
+CREATE OR REPLACE TABLE bmi_analysis AS
+SELECT
+  sport,
+  year,
+  ROUND(AVG(calculate_bmi(height, weight)), 1) AS avg_bmi,
+  CORR(calculate_bmi(height, weight), 
+       CASE WHEN medal != 'None' THEN 1 ELSE 0 END) AS medal_corr
+FROM clean_olympics
+GROUP BY sport,year
+HAVING medal_corr IS NOT NULL;
+
+
+-- 1. Medal trends by country
+SELECT
+  noc,
+  year,
+  SUM(CASE WHEN medal != 'None' THEN 1 ELSE 0 END) AS total_medals,
+  RATIO_TO_REPORT(total_medals) OVER (PARTITION BY year) AS medal_share
+FROM clean_olympics
+GROUP BY noc, year
+ORDER BY year, total_medals DESC;
+
+
+--Athlete participation growth
+SELECT
+  year,
+  season,
+  COUNT(DISTINCT athlete_id) AS participants,
+  (participants - LAG(participants) OVER (PARTITION BY season ORDER BY year)) 
+    / LAG(participants) OVER (PARTITION BY season ORDER BY year) * 100 AS growth_pct
+FROM clean_olympics
+GROUP BY year, season;
+
+
+--Female participation analysis
+SELECT
+  year,
+  sport,
+  COUNT_IF(sex = 'F') AS female_athletes,
+  COUNT_IF(sex = 'M') AS male_athletes,
+  female_athletes / (female_athletes + male_athletes) * 100 AS female_percentage
+FROM clean_olympics
+GROUP BY year, sport
+HAVING female_percentage > 0
+ORDER BY year female_percentage DESC;
+
+
+
+--Medal Dominance Trends (Country-Sport Pairs) sql
+WITH medal_counts AS (
+  SELECT
+    sport,
+    noc,
+    COUNT_IF(medal != 'None') AS total_medals
+  FROM clean_olympics
+  GROUP BY sport, noc
+),
+sport_totals AS (
+  SELECT
+    sport,
+    SUM(total_medals) AS sport_total_medals
+  FROM medal_counts
+  GROUP BY sport
+),
+dominance AS (
+  SELECT
+    m.sport,
+    m.noc AS dominant_country,
+    m.total_medals,
+    LEAD(m.total_medals) OVER (PARTITION BY m.sport ORDER BY m.total_medals DESC) AS second_place_medals,
+    RANK() OVER (PARTITION BY m.sport ORDER BY m.total_medals DESC) AS rank
+  FROM medal_counts m
+)
+SELECT
+  d.sport,
+  d.dominant_country,
+  d.total_medals,
+  s.sport_total_medals,
+  ROUND(d.total_medals * 100.0 / s.sport_total_medals, 1) AS dominance_pct,
+  COALESCE(d.total_medals - d.second_place_medals, 0) AS medal_margin,
+  CASE 
+    WHEN d.total_medals > s.sport_total_medals * 0.5 THEN 'Absolute Dominance'
+    WHEN d.total_medals > s.sport_total_medals * 0.3 THEN 'Strong Leadership'
+    ELSE 'Competitive'
+  END AS dominance_category
+FROM dominance d
+JOIN sport_totals s ON d.sport = s.sport
+WHERE d.rank = 1
+ORDER BY dominance_pct DESC;
+
+
+--Age Performance Distribution by Sport
+SELECT
+    sport,
+    medal,
+    age,
+    ROUND(PERCENT_RANK() OVER (PARTITION BY sport, medal ORDER BY age), 2) AS age_percentile,
+    ROUND(CUME_DIST() OVER (PARTITION BY sport ORDER BY age), 2) AS cumulative_dist,
+    ROUND(AVG(age) OVER (PARTITION BY sport), 1) AS sport_avg_age,
+    ROUND(age - AVG(age) OVER (PARTITION BY sport), 1) AS age_deviation,
+    CASE
+        WHEN age < PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY age) OVER (PARTITION BY sport) THEN 'Young'
+        WHEN age > PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY age) OVER (PARTITION BY sport) THEN 'Veteran'
+        ELSE 'Prime'
+    END AS age_category
+FROM clean_olympics
+WHERE medal != 'None';
+
+--CAREER SPAN
+WITH athlete_summary AS (
+  SELECT
+    athlete_id,
+    name,
+    sport,
+    MIN(year) AS first_year,
+    MAX(year) AS last_year
+  FROM clean_olympics
+  GROUP BY athlete_id, name, sport
+),
+career_spans AS (
+  SELECT
+    sport,
+    name,
+    last_year - first_year AS career_span
+  FROM athlete_summary
+),
+long_athletes AS (
+  SELECT
+    sport,
+    ARRAY_AGG(name) WITHIN GROUP (ORDER BY career_span DESC) AS long_career_athletes
+  FROM career_spans
+  WHERE career_span >= 20
+  GROUP BY sport
+),
+sport_stats AS (
+  SELECT
+    sport,
+    ROUND(AVG(career_span), 1) AS avg_career_span_yrs,
+    MEDIAN(career_span) AS median_career_span,
+    MAX(career_span) AS max_career_span
+  FROM career_spans
+  GROUP BY sport
+)
+SELECT
+  s.sport,
+  s.avg_career_span_yrs,
+  s.median_career_span,
+  s.max_career_span,
+  l.long_career_athletes
+FROM sport_stats s
+LEFT JOIN long_athletes l ON s.sport = l.sport
+ORDER BY s.avg_career_span_yrs DESC;
+
+--top 3 countries--
+WITH yearly_medals AS (
+  SELECT
+    year,
+    noc AS country,
+    COUNT_IF(medal != 'None') AS total_medals,
+    DENSE_RANK() OVER (
+      PARTITION BY year 
+      ORDER BY total_medals DESC
+    ) AS rank
+  FROM clean_olympics
+  GROUP BY year, noc
+  HAVING total_medals > 0
+),
+top_countries AS (
+  SELECT *
+  FROM yearly_medals
+  WHERE rank <= 3
+)
+SELECT
+  year,
+  country,
+  total_medals,
+  rank,
+  CASE rank
+    WHEN 1 THEN '🥇 1st'
+    WHEN 2 THEN '🥈 2nd'
+    WHEN 3 THEN '🥉 3rd'
+  END AS rank_label
+FROM top_countries
+ORDER BY year ASC, rank ASC;
